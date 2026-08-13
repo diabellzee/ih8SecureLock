@@ -87,20 +87,28 @@ bool getMapping(const char* lib_name, ino_t* inode, dev_t* dev) {
     return true;
 }
 
-uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* field_name) {
-    jclass cls = env->FindClass(cls_name);
+uint32_t getStaticIntFieldJni(JNIEnv* env, jclass cls, const char* field_name, const char* cls_name_for_log) {
     if (cls == nullptr) {
-        env->ExceptionClear();
-        LOGD("ERROR getStaticIntFieldJni: Could not get class '%s'", cls_name);
+        // Caller already tried FindClass and it failed (and already cleared
+        // the resulting exception) -- nothing more to look up.
+        LOGD("ERROR getStaticIntFieldJni: Could not get class '%s'", cls_name_for_log);
         return 0;
     }
     jfieldID field = env->GetStaticFieldID(cls, field_name, "I");
     if (field == nullptr) {
         env->ExceptionClear();
-        LOGD("ERROR getStaticIntFieldJni: Could not get field %s.%s", cls_name, field_name);
+        LOGD("ERROR getStaticIntFieldJni: Could not get field %s.%s", cls_name_for_log, field_name);
         return 0;
     }
     jint val = env->GetStaticIntField(cls, field);
+    return val;
+}
+
+uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* field_name) {
+    jclass cls = env->FindClass(cls_name);
+    if (cls == nullptr) env->ExceptionClear();
+    uint32_t val = getStaticIntFieldJni(env, cls, field_name, cls_name);
+    if (cls != nullptr) env->DeleteLocalRef(cls);
     return val;
 }
 

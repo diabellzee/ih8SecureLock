@@ -22,9 +22,6 @@
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-#define ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
-#define STR_LEN(a) (ARR_LEN(a) - 1)
-
 #define FLAG_SECURE 0x00002000
 
 #define I_WINDOW_SESSION_DESC u"android.view.IWindowSession"
@@ -43,6 +40,19 @@ static uint32_t binderHeadersLen = 0;
 // `code` with no separate failure case to special-case -- see below.
 static uint32_t relayout_code = UINT32_MAX;
 static uint32_t relayoutAsync_code = UINT32_MAX;
+// Android 17 (SDK 37): IWindowSession gained relayout2/relayoutAsync2
+// alongside the existing relayout/relayoutAsync -- see upstream v9
+// (https://github.com/j-hc/ih8SecureLock, PR #11 by @jackyzy823) and
+// https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-17.0.0_r1/core/java/android/view/IWindowSession.aidl#93.
+// Android 17 was still in beta as of this writing and that AIDL has
+// historically been reshuffled across releases (relayout itself gained a
+// new lastSyncSeqId parameter at some point, for instance) -- upstream's
+// own comment already flags relayout2 as "maybe removed in the future".
+// On any SDK where it doesn't exist the lookup below sentinels to
+// UINT32_MAX exactly like every other optional transaction code here, so
+// this is safe to probe for unconditionally without an explicit SDK gate.
+static uint32_t relayout2_code = UINT32_MAX;
+static uint32_t relayoutAsync2_code = UINT32_MAX;
 static uint32_t registerScreenCaptureObserver_code = UINT32_MAX;
 // Android 15+ (VANILLA_ICE_CREAM) screen-*record*-detection counterpart to
 // registerScreenCaptureObserver above -- see IWindowManager.aidl's
@@ -67,16 +77,45 @@ static const char* PROC_NAME = "";
 static inline uint32_t toSentinel(uint32_t code) { return code == 0 ? UINT32_MAX : code; }
 
 static bool getTransactionCodes(JNIEnv* env) {
-    relayout_code = toSentinel(getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayout")));
-    relayoutAsync_code =
-        toSentinel(getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayoutAsync")));
-    registerScreenCaptureObserver_code = toSentinel(getStaticIntFieldJni(
-        env, STUB("android/app/IActivityTaskManager"), TRSCTN("registerScreenCaptureObserver")));
+    // 4 of the 6 lookups below (relayout/relayoutAsync/relayout2/
+    // relayoutAsync2) target the *same* class, IWindowSession$Stub. The
+    // previous version called getStaticIntFieldJni(env, "...IWindowSession",
+    // ...) separately per field, so FindClass() -- a full classloader
+    // lookup, not a cheap pointer compare -- ran 4 times over for one
+    // class. This runs once per app process (postAppSpecialize, at zygote
+    // fork time), so the win is small in absolute terms, but it's paid on
+    // *every* app cold start on the device, across every app the module
+    // hooks. Resolving each distinct class once and reusing the jclass
+    // across its field lookups cuts this from 6 FindClass calls to 3.
+    jclass windowSessionCls = env->FindClass(BINDER_STUB("android/view/IWindowSession"));
+    if (windowSessionCls == nullptr) env->ExceptionClear();
+    jclass activityTaskManagerCls = env->FindClass(BINDER_STUB("android/app/IActivityTaskManager"));
+    if (activityTaskManagerCls == nullptr) env->ExceptionClear();
+    jclass windowManagerCls = env->FindClass(BINDER_STUB("android/view/IWindowManager"));
+    if (windowManagerCls == nullptr) env->ExceptionClear();
+
+    relayout_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayout"),
+                                                     "android/view/IWindowSession$Stub"));
+    relayoutAsync_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayoutAsync"),
+                                                          "android/view/IWindowSession$Stub"));
+    relayout2_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayout2"),
+                                                      "android/view/IWindowSession$Stub"));
+    relayoutAsync2_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayoutAsync2"),
+                                                           "android/view/IWindowSession$Stub"));
+    registerScreenCaptureObserver_code = toSentinel(
+        getStaticIntFieldJni(env, activityTaskManagerCls, BINDER_TRSCTN("registerScreenCaptureObserver"),
+                              "android/app/IActivityTaskManager$Stub"));
     registerScreenRecordingCallback_code = toSentinel(
-        getStaticIntFieldJni(env, STUB("android/view/IWindowManager"), TRSCTN("registerScreenRecordingCallback")));
+        getStaticIntFieldJni(env, windowManagerCls, BINDER_TRSCTN("registerScreenRecordingCallback"),
+                              "android/view/IWindowManager$Stub"));
+
+    if (windowSessionCls != nullptr) env->DeleteLocalRef(windowSessionCls);
+    if (activityTaskManagerCls != nullptr) env->DeleteLocalRef(activityTaskManagerCls);
+    if (windowManagerCls != nullptr) env->DeleteLocalRef(windowManagerCls);
 
     if (registerScreenCaptureObserver_code == UINT32_MAX && relayoutAsync_code == UINT32_MAX &&
-        relayout_code == UINT32_MAX && registerScreenRecordingCallback_code == UINT32_MAX) {
+        relayout_code == UINT32_MAX && relayoutAsync2_code == UINT32_MAX && relayout2_code == UINT32_MAX &&
+        registerScreenRecordingCallback_code == UINT32_MAX) {
         LOGD("ERROR getTransactionCodes: Could not get any transaction codes");
         return false;
     }
@@ -99,8 +138,8 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     // equal (they run 1..0x00FFFFFF) -- so a failed lookup simply never
     // matches any real `code` here, with no separate `code == 0` check
     // needed on this per-call path.
-    if (likely(code != relayout_code && code != relayoutAsync_code &&
-               code != registerScreenCaptureObserver_code &&
+    if (likely(code != relayout_code && code != relayoutAsync_code && code != relayout2_code &&
+               code != relayoutAsync2_code && code != registerScreenCaptureObserver_code &&
                code != registerScreenRecordingCallback_code)) {
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
@@ -136,10 +175,24 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     // that branch's inner `if` is simply false and we fall through to the
     // ordinary transactOrig() at the bottom, i.e. worst case on a coincidental
     // code collision is "no bypass applied for this call", never a crash.
-    if (code == relayout_code || code == relayoutAsync_code) {
-        if (STR_LEN(I_WINDOW_SESSION_DESC) == descLen &&
-            memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
+    if (code == relayout_code || code == relayoutAsync_code || code == relayout2_code ||
+        code == relayoutAsync2_code) {
+        if (BINDER_DESC_CMP(I_WINDOW_SESSION_DESC, desc, descLen)) {
             // remove FLAG_SECURE mask
+            //
+            // relayout2/relayoutAsync2 (SDK 37+) are assumed to share this
+            // same skip sequence up to `flags` -- that's upstream's own PR
+            // design (see the relayout2_code comment above), not something
+            // independently re-derived here: Android 17 was still in beta
+            // as of this writing and the exact relayout2 parameter layout
+            // wasn't something a fixed AOSP tag could confirm with
+            // certainty. If that assumption turns out wrong on a real
+            // device, the bounds-checked peekInt32Ref()/ok() guard below
+            // fails closed (no bypass applied) rather than corrupting an
+            // unrelated field silently in-bounds -- but only for a
+            // *shorter* relayout2 payload; a *reordered-but-same-length*
+            // one wouldn't be caught by a bounds check at all. Worth
+            // confirming against a real Android 17 device once out of beta.
 
             parcel.skipFlatObj();                              // IWindow flat obj
             if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
@@ -153,15 +206,13 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
             }
         }
     } else if (code == registerScreenCaptureObserver_code) {
-        if (STR_LEN(I_ACTIVITY_TASKMANAGER_DESC) == descLen &&
-            memcmp(desc, I_ACTIVITY_TASKMANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
+        if (BINDER_DESC_CMP(I_ACTIVITY_TASKMANAGER_DESC, desc, descLen)) {
             // early-return from capture listener
             LOGD("Bypassed screenshot listener");
             return 0;
         }
     } else {  // code == registerScreenRecordingCallback_code
-        if (STR_LEN(I_WINDOW_MANAGER_DESC) == descLen &&
-            memcmp(desc, I_WINDOW_MANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
+        if (BINDER_DESC_CMP(I_WINDOW_MANAGER_DESC, desc, descLen)) {
             // registerScreenRecordingCallback(IScreenRecordingCallback)
             // returns boolean (whether recording is active). An untouched,
             // empty reply is correct here, not just convenient: both

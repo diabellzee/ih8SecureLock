@@ -2,6 +2,7 @@
 
 #include <jni.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/types.h>
 
 #if defined(__LP64__)
@@ -12,6 +13,23 @@
 
 #define STUB(n) (n "$Stub")
 #define TRSCTN(n) ("TRANSACTION_" n)
+
+#define ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define STR_LEN(a) (ARR_LEN(a) - 1)
+
+// Renamed from the original bare STUB/TRSCTN (as adopted from upstream v9,
+// https://github.com/j-hc/ih8SecureLock) to avoid the generic names
+// colliding with anything else that includes this header.
+#define BINDER_STUB(n) (n "$Stub")
+#define BINDER_TRSCTN(n) ("TRANSACTION_" n)
+
+// Combines the "does descLen/desc match this literal interface descriptor"
+// check used at every transactHook() branch into one place, instead of
+// repeating the STR_LEN(...)==descLen && memcmp(...)==0 pair at each call
+// site (also adopted from upstream v9's consolidation of the same pattern).
+#define BINDER_DESC_CMP(descLit, desc, descLen) \
+    (STR_LEN(descLit) == (descLen) &&           \
+     memcmp((desc), (descLit), (descLen) * sizeof(char16_t)) == 0)
 
 struct PParcel {
     // Layout must mirror the real android::Parcel object we alias onto via
@@ -126,6 +144,15 @@ inline size_t getBinderHeadersLen(int sdk) {
 bool getMapping(const char* lib, ino_t* inode, dev_t* dev);
 
 uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* field_name);
+
+// Overload for callers reading several static int fields off the *same*
+// class (e.g. getTransactionCodes() in module.cpp: 4 of its 6 lookups all
+// target IWindowSession$Stub). FindClass() is a full classloader lookup,
+// not a cheap operation -- resolving the jclass once and reusing it across
+// fields avoids paying for that lookup redundantly. cls_name_for_log is
+// only used for the error log line and need not be independently
+// resolvable (the class was already looked up by the caller).
+uint32_t getStaticIntFieldJni(JNIEnv* env, jclass cls, const char* field_name, const char* cls_name_for_log);
 
 // NOTE: not currently called anywhere in this module (no companion process is
 // used - all hooking happens in-process). Kept as a general-purpose utility
