@@ -4,39 +4,87 @@
 #include <asm-generic/fcntl.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #define LOGD(fmt, ...) \
     __android_log_print(ANDROID_LOG_DEBUG, "ih8SecureLock", "[%d] " fmt, __LINE__, ##__VA_ARGS__)
 
-bool getMapping(const char* lib_name, ino_t* inode, dev_t* dev) {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
-    char mapbuf[256], flags[8];
-    size_t lib_name_len = strlen(lib_name);
-    while (fgets(mapbuf, sizeof(mapbuf), fp)) {
-        unsigned int dev_major, dev_minor;
-        int cur = 0;
-        // %7s is bounded to sizeof(flags)-1 so a malformed/unexpected line
-        // (e.g. no whitespace where expected) can never overflow `flags`.
-        // %n is only written if every prior conversion succeeded, so on a
-        // partial/failed match `cur` stays 0 and the length check below
-        // safely skips the line instead of reading before mapbuf[0].
-        sscanf(mapbuf, "%*s %7s %*x %x:%x %lu %*s%n", flags, &dev_major, &dev_minor, inode, &cur);
-        if ((size_t)cur < lib_name_len) continue;
-        if (memcmp(&mapbuf[(size_t)cur - lib_name_len], lib_name, lib_name_len) == 0 && flags[2] == 'x') {
-            *dev = makedev(dev_major, dev_minor);
-            fclose(fp);
-            return true;
-        }
+namespace {
+
+struct MappingSearch {
+    const char* lib_name;
+    size_t lib_name_len;
+    ino_t inode;
+    dev_t dev;
+    bool found;
+};
+
+// Called once per loaded module (shared object or the main executable) by
+// dl_iterate_phdr(), courtesy of the dynamic linker's own bookkeeping --
+// not by scraping /proc/self/maps text. This sidesteps the previous
+// approach's two structural weaknesses: (1) a library backed by a pathname
+// containing whitespace would break the %*s-based field split, and (2) each
+// shared object shows up as *several* /proc/self/maps lines (text r-xp,
+// rodata r--p, data rw-p, ...) all needing the same dev/inode, which is why
+// the old code additionally had to filter on flags[2]=='x' to land on one
+// specific line. Here the linker already hands us one entry per module, so
+// neither problem exists: dlpi_name is the exact path (no need to search
+// for the library name as a substring of a larger line), and dev/inode is
+// pulled straight from stat() on that path -- the same value every segment
+// of that module would resolve to, obtained without caring which segment.
+int mappingCallback(dl_phdr_info* info, size_t /*size*/, void* data) {
+    auto* ctx = static_cast<MappingSearch*>(data);
+    // The main executable (and occasionally the VDSO/linker itself) reports
+    // an empty dlpi_name; nothing to match against, so skip rather than let
+    // the length check below underflow.
+    if (info->dlpi_name == nullptr || info->dlpi_name[0] == '\0') return 0;
+
+    size_t path_len = strlen(info->dlpi_name);
+    if (path_len < ctx->lib_name_len) return 0;
+    // Suffix match on the full path, e.g. "/apex/.../lib64/libbinder.so"
+    // ends with "libbinder.so" -- same matching semantics the old
+    // maps-parsing version used, just against a clean path string instead
+    // of an arbitrary slice of a text line.
+    size_t match_start = path_len - ctx->lib_name_len;
+    if (memcmp(info->dlpi_name + match_start, ctx->lib_name, ctx->lib_name_len) != 0) {
+        return 0;
     }
-    fclose(fp);
-    return false;
+    // Beyond matching the tail characters, require them to actually start a
+    // path *component*: either the whole path is exactly lib_name, or the
+    // byte right before the match is '/'. Without this, a module named
+    // e.g. "vendor_liblibbinder.so" would satisfy a plain suffix check even
+    // though it isn't the library being searched for -- same class of bug
+    // a real string-vs-string equality check on a basename would avoid,
+    // here done cheaply without a separate basename() call.
+    if (match_start != 0 && info->dlpi_name[match_start - 1] != '/') return 0;
+
+    struct stat st;
+    if (stat(info->dlpi_name, &st) != 0) {
+        // Matched by name but the path no longer resolves (e.g. the file
+        // was unlinked out from under a still-mapped inode). Keep looking
+        // rather than report a stale/zeroed dev+inode as if it were valid.
+        return 0;
+    }
+    ctx->inode = st.st_ino;
+    ctx->dev = st.st_dev;
+    ctx->found = true;
+    return 1;  // non-zero stops dl_iterate_phdr's iteration
+}
+
+}  // namespace
+
+bool getMapping(const char* lib_name, ino_t* inode, dev_t* dev) {
+    MappingSearch ctx{lib_name, strlen(lib_name), 0, 0, false};
+    dl_iterate_phdr(mappingCallback, &ctx);
+    if (!ctx.found) return false;
+    *inode = ctx.inode;
+    *dev = ctx.dev;
+    return true;
 }
 
 uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* field_name) {

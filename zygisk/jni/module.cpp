@@ -4,7 +4,17 @@
 #include <string.h>
 
 #include "binder.hpp"
+// zygisk.hpp is vendored (upstream, not ours to modify -- see the same
+// reasoning in build.yml's cppcheck suppressions). -Werror is enabled in
+// Android.mk for our own code; scoping the ignore to just this include
+// keeps that guarantee for module.cpp itself while not caring what, if
+// anything, -Wall/-Wextra/-Wshadow find in a header we don't control.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+#pragma GCC diagnostic ignored "-Wshadow"
 #include "zygisk.hpp"
+#pragma GCC diagnostic pop
 
 #define LOGD(fmt, ...) \
     __android_log_print(ANDROID_LOG_DEBUG, "ih8SecureLock", "[%d] [%s] " fmt, __LINE__, PROC_NAME, ##__VA_ARGS__)
@@ -22,6 +32,10 @@
 #define I_WINDOW_MANAGER_DESC u"android.view.IWindowManager"
 
 static int sdk = 0;
+// getBinderHeadersLen(sdk) only ever depends on `sdk`, which is fixed once
+// at process start -- computed once here instead of on every matched
+// transaction in transactHook() below.
+static uint32_t binderHeadersLen = 0;
 // UINT32_MAX (never a real AIDL transaction code -- those run from
 // FIRST_CALL_TRANSACTION=1 to LAST_CALL_TRANSACTION=0x00FFFFFF) is the
 // "lookup failed / not applicable" sentinel, not 0. This lets
@@ -97,7 +111,7 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     }
 
     auto parcel = FakeParcel(pparcel->data, pparcel->data_size);
-    parcel.skip((uint32_t)getBinderHeadersLen(sdk));  // header
+    parcel.skip(binderHeadersLen);  // header
 
     auto descLen = parcel.readInt32();
     auto desc = parcel.readString16(descLen);
@@ -196,6 +210,7 @@ static bool run(zygisk::Api* api, JNIEnv* env) {
         LOGD("ERROR android_get_device_api_level: %d", sdk);
         return false;
     }
+    binderHeadersLen = (uint32_t)getBinderHeadersLen(sdk);
     if (!getTransactionCodes(env)) return false;
     if (!hookBinder(api)) return false;
     return true;

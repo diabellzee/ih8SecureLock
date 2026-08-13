@@ -32,7 +32,7 @@ jobs:
   # cross-compiling four ABIs.
   # ---------------------------------------------------------------------
   lint:
-    name: Static analysis (cppcheck)
+    name: Static analysis (shellcheck + cppcheck)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -41,8 +41,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install cppcheck
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck
+      - name: Install cppcheck + shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck shellcheck
+
+      - name: shellcheck — package_module.sh, customize.sh
+        run: |
+          shellcheck scripts/package_module.sh
+          shellcheck -s sh module/customize.sh
+        # customize.sh's shebang is #!/system/bin/sh (Android's toolbox/
+        # busybox sh at install time, not bash) -- `-s sh` tells shellcheck
+        # to lint it as POSIX sh instead of guessing from the shebang path,
+        # which it can't resolve to a known shell on a Linux runner.
 
       - name: cppcheck — module.cpp, binder.cpp, binder.hpp
         working-directory: zygisk/jni

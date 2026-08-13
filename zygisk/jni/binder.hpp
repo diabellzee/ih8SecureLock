@@ -95,9 +95,25 @@ inline uint32_t FakeParcel::readInt32() {
 inline char16_t* FakeParcel::readString16(uint32_t len) {
     // len+1 for the trailing null u16
     uint64_t bytes = (uint64_t)len * sizeof(char16_t) + sizeof(char16_t);
-    if (!ensure(bytes)) return nullptr;
+    // android::Parcel::writeString16() writes through writeInplace(), which
+    // always advances mDataPos to a 4-byte boundary (pad_size() in
+    // AOSP's Parcel.cpp), even though only `bytes` of it is meaningful
+    // data -- the rest is padding. Every one of our three hardcoded
+    // descriptors happens to have odd char16 length ((len+1) even),
+    // making `bytes` already a multiple of 4, so this padding was
+    // previously invisible. It stops being invisible the moment anyone
+    // hooks a descriptor with even char16 length (e.g.
+    // "android.app.IActivityTaskManager", len=32) *and* reads parcel
+    // fields after the descriptor: without this rounding, `cur` would
+    // land 2 bytes short of the real next field, silently misreading
+    // (and, for the flags-clear path, silently corrupting) whatever
+    // happens to sit at the wrong offset -- not an OOB the ensure()
+    // bounds-check would catch, since the misaligned read is still
+    // within the buffer.
+    uint64_t padded = (bytes + 3) & ~(uint64_t)3;
+    if (!ensure(padded)) return nullptr;
     char16_t* s = (char16_t*)(data + cur);
-    cur += (uint32_t)bytes;
+    cur += (uint32_t)padded;
     return s;
 }
 
