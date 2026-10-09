@@ -44,7 +44,7 @@ static uint32_t relayoutAsync_code = UINT32_MAX;
 // alongside the existing relayout/relayoutAsync -- see upstream v9
 // (https://github.com/j-hc/ih8SecureLock, PR #11 by @jackyzy823) and
 // https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-17.0.0_r1/core/java/android/view/IWindowSession.aidl#93.
-// Android 17 was still in beta as of this writing and that AIDL has
+// Android 17 was still in beta when this was first written and that AIDL has
 // historically been reshuffled across releases (relayout itself gained a
 // new lastSyncSeqId parameter at some point, for instance) -- upstream's
 // own comment already flags relayout2 as "maybe removed in the future".
@@ -274,12 +274,28 @@ class ih8SecureLock : public zygisk::ModuleBase {
         this->env = env_in;
     }
 
+    // Upstream v10 (PR #13 by @nakoo): honor the Zygisk denylist. For a
+    // process on the denylist, Magisk/KernelSU unmounts modules, so we must
+    // not hook it and must request an unload of our library up front.
+    void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
+        (void)args;
+        if (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+        }
+    }
+
     void preServerSpecialize(zygisk::ServerSpecializeArgs* args) override {
         (void)args;
         api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
+        // Denylisted process: DLCLOSE was already requested in
+        // preAppSpecialize(); install no hooks (upstream v10).
+        if (api->getFlags() & zygisk::StateFlag::PROCESS_ON_DENYLIST) {
+            return;
+        }
+
         if (unlikely(args->nice_name == nullptr)) {
             // Nothing to hook without a process name to attribute logs to;
             // bail out rather than pass a null jstring into JNI.
