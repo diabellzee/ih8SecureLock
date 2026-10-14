@@ -16,8 +16,29 @@
 #include "zygisk.hpp"
 #pragma GCC diagnostic pop
 
-#define LOGD(fmt, ...) \
-    __android_log_print(ANDROID_LOG_DEBUG, "ih8SecureLock", "[%d] [%s] " fmt, __LINE__, PROC_NAME, ##__VA_ARGS__)
+#define LOG_TAG "ih8SecureLock"
+
+// Init-time errors and lifecycle messages. These fire a handful of times per
+// process at most, never on the Binder path, so they stay unconditional.
+#define LOGE(fmt, ...) \
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "[%d] [%s] " fmt, __LINE__, PROC_NAME, ##__VA_ARGS__)
+#define LOGI(fmt, ...) \
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[%d] [%s] " fmt, __LINE__, PROC_NAME, ##__VA_ARGS__)
+
+// Per-event messages from the Binder path ("Bypassed ..."). A secure window
+// can be relaid out many times a second, and every __android_log_print() is a
+// socket write to logd, so each *kind* of bypass is logged once per process:
+// enough to confirm in logcat that the module is doing its job, without
+// paying a syscall on every transaction. The flag is checked with a relaxed
+// load first so the common already-logged case is a plain read, not an
+// atomic read-modify-write on a shared cache line.
+#define LOGI_ONCE(flag, fmt, ...)                                                    \
+    do {                                                                             \
+        if (!__atomic_load_n(&(flag), __ATOMIC_RELAXED) &&                           \
+            !__atomic_exchange_n(&(flag), true, __ATOMIC_RELAXED)) {                 \
+            LOGI(fmt, ##__VA_ARGS__);                                                \
+        }                                                                            \
+    } while (0)
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -28,219 +49,240 @@
 #define I_ACTIVITY_TASKMANAGER_DESC u"android.app.IActivityTaskManager"
 #define I_WINDOW_MANAGER_DESC u"android.view.IWindowManager"
 
+// Lowest SDK at which each *optional* transaction is worth probing for.
+// Each is deliberately one release below the release the transaction first
+// appeared in, for two reasons: (1) preview builds of release N report
+// android_get_device_api_level() == N-1 (with a codename), so an exact
+// "introduced in N" gate would wrongly exclude beta devices, and (2) it
+// keeps feature detection (the JNI field lookup) as the real arbiter if a
+// vendor backports a transaction a little early. Below these bounds the
+// lookup cannot succeed, so we skip it entirely instead of paying for a
+// FindClass()/GetStaticFieldID() that is guaranteed to fail (and to throw
+// and clear a NoSuchFieldError) in every app process on every cold start.
+//
+//   registerScreenCaptureObserver    Android 14 (SDK 34)
+//   registerScreenRecordingCallback  Android 15 (SDK 35)
+//   relayout2 / relayoutAsync2       Android 17 (SDK 37)
+//
+// relayout/relayoutAsync are always probed: relayout exists on every
+// supported release and relayoutAsync appeared in a 13 QPR, so no clean SDK
+// bound exists for it.
+constexpr int kMinSdkScreenCaptureObserver = 33;
+constexpr int kMinSdkScreenRecordingCallback = 34;
+constexpr int kMinSdkRelayout2 = 36;
+
 static int sdk = 0;
 // getBinderHeadersLen(sdk) only ever depends on `sdk`, which is fixed once
-// at process start -- computed once here instead of on every matched
-// transaction in transactHook() below.
+// at process start -- computed once here instead of per matched transaction.
 static uint32_t binderHeadersLen = 0;
+
 // UINT32_MAX (never a real AIDL transaction code -- those run from
 // FIRST_CALL_TRANSACTION=1 to LAST_CALL_TRANSACTION=0x00FFFFFF) is the
-// "lookup failed / not applicable" sentinel, not 0. This lets
-// transactHook()'s hot-path fast-reject do a plain N-way compare against
-// `code` with no separate failure case to special-case -- see below.
-static uint32_t relayout_code = UINT32_MAX;
-static uint32_t relayoutAsync_code = UINT32_MAX;
+// "lookup failed / not applicable" sentinel, so the hot path can do a plain
+// N-way compare against `code` with no separate failure case.
+constexpr uint32_t kNoCode = UINT32_MAX;
+static uint32_t relayout_code = kNoCode;
+static uint32_t relayoutAsync_code = kNoCode;
 // Android 17 (SDK 37): IWindowSession gained relayout2/relayoutAsync2
-// alongside the existing relayout/relayoutAsync -- see upstream v9
-// (https://github.com/j-hc/ih8SecureLock, PR #11 by @jackyzy823) and
-// https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-17.0.0_r1/core/java/android/view/IWindowSession.aidl#93.
-// Android 17 was still in beta when this was first written and that AIDL has
-// historically been reshuffled across releases (relayout itself gained a
-// new lastSyncSeqId parameter at some point, for instance) -- upstream's
-// own comment already flags relayout2 as "maybe removed in the future".
-// On any SDK where it doesn't exist the lookup below sentinels to
-// UINT32_MAX exactly like every other optional transaction code here, so
-// this is safe to probe for unconditionally without an explicit SDK gate.
-static uint32_t relayout2_code = UINT32_MAX;
-static uint32_t relayoutAsync2_code = UINT32_MAX;
-static uint32_t registerScreenCaptureObserver_code = UINT32_MAX;
-// Android 15+ (VANILLA_ICE_CREAM) screen-*record*-detection counterpart to
-// registerScreenCaptureObserver above -- see IWindowManager.aidl's
+// alongside relayout/relayoutAsync -- see upstream v9
+// (https://github.com/j-hc/ih8SecureLock, PR #11 by @jackyzy823). Upstream's
+// own comment already flags them as "maybe removed in the future"; on any
+// SDK where they don't exist the lookup sentinels to kNoCode.
+static uint32_t relayout2_code = kNoCode;
+static uint32_t relayoutAsync2_code = kNoCode;
+static uint32_t registerScreenCaptureObserver_code = kNoCode;
+// Android 15+ screen-*record*-detection counterpart to
+// registerScreenCaptureObserver -- IWindowManager.aidl's
 // registerScreenRecordingCallback(IScreenRecordingCallback), which backs the
-// public WindowManager#addScreenRecordingCallback() API. On pre-15 devices
-// android.view.IWindowManager$Stub simply has no
-// TRANSACTION_registerScreenRecordingCallback field, so the lookup below
-// fails exactly like any other unavailable transaction and this sentinels
-// to UINT32_MAX -- safe to probe for unconditionally, no explicit SDK-gate
-// needed (mirrors how registerScreenCaptureObserver already degrades on
-// pre-14 devices).
-static uint32_t registerScreenRecordingCallback_code = UINT32_MAX;
+// public WindowManager#addScreenRecordingCallback() API.
+static uint32_t registerScreenRecordingCallback_code = kNoCode;
 
 static const char* PROC_NAME = "";
 
-// getStaticIntFieldJni() returns 0 both on genuine lookup failure and on
-// the (never-happens-in-practice) case of an actual field value of 0;
-// either way 0 is not a code transactHook() should ever match against, so
-// remap it to the UINT32_MAX sentinel right here, once at init time,
-// rather than re-checking `code == 0` on every single Binder transaction
-// in the process for the rest of its life.
-static inline uint32_t toSentinel(uint32_t code) { return code == 0 ? UINT32_MAX : code; }
+// "Bypassed ..." already logged for this process? (see LOGI_ONCE)
+static bool loggedSecureBypass = false;
+static bool loggedScreenshotBypass = false;
+static bool loggedRecordingBypass = false;
+
+// getStaticIntFieldJni() returns 0 on lookup failure; 0 is never a code
+// transactHook() should match, so remap it to kNoCode once, at init time.
+static inline uint32_t toSentinel(uint32_t code) { return code == 0 ? kNoCode : code; }
+
+static jclass findClassOrNull(JNIEnv* env, const char* name) {
+    jclass cls = env->FindClass(name);
+    if (cls == nullptr) env->ExceptionClear();
+    return cls;
+}
+
+static bool anyCodeResolved() {
+    return relayout_code != kNoCode || relayoutAsync_code != kNoCode || relayout2_code != kNoCode ||
+           relayoutAsync2_code != kNoCode || registerScreenCaptureObserver_code != kNoCode ||
+           registerScreenRecordingCallback_code != kNoCode;
+}
 
 static bool getTransactionCodes(JNIEnv* env) {
-    // 4 of the 6 lookups below (relayout/relayoutAsync/relayout2/
-    // relayoutAsync2) target the *same* class, IWindowSession$Stub. The
-    // previous version called getStaticIntFieldJni(env, "...IWindowSession",
-    // ...) separately per field, so FindClass() -- a full classloader
-    // lookup, not a cheap pointer compare -- ran 4 times over for one
-    // class. This runs once per app process (postAppSpecialize, at zygote
-    // fork time), so the win is small in absolute terms, but it's paid on
-    // *every* app cold start on the device, across every app the module
-    // hooks. Resolving each distinct class once and reusing the jclass
-    // across its field lookups cuts this from 6 FindClass calls to 3.
-    jclass windowSessionCls = env->FindClass(BINDER_STUB("android/view/IWindowSession"));
-    if (windowSessionCls == nullptr) env->ExceptionClear();
-    jclass activityTaskManagerCls = env->FindClass(BINDER_STUB("android/app/IActivityTaskManager"));
-    if (activityTaskManagerCls == nullptr) env->ExceptionClear();
-    jclass windowManagerCls = env->FindClass(BINDER_STUB("android/view/IWindowManager"));
-    if (windowManagerCls == nullptr) env->ExceptionClear();
+    // Each distinct class is resolved once and reused across its field
+    // lookups; classes that cannot carry any wanted field on this SDK (see
+    // kMinSdk* above) are not looked up at all.
+    static const char* const kSessionStub = BINDER_STUB("android/view/IWindowSession");
+    static const char* const kAtmStub = BINDER_STUB("android/app/IActivityTaskManager");
+    static const char* const kWmStub = BINDER_STUB("android/view/IWindowManager");
 
-    relayout_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayout"),
-                                                     "android/view/IWindowSession$Stub"));
-    relayoutAsync_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayoutAsync"),
-                                                          "android/view/IWindowSession$Stub"));
-    relayout2_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayout2"),
-                                                      "android/view/IWindowSession$Stub"));
-    relayoutAsync2_code = toSentinel(getStaticIntFieldJni(env, windowSessionCls, BINDER_TRSCTN("relayoutAsync2"),
-                                                           "android/view/IWindowSession$Stub"));
-    registerScreenCaptureObserver_code = toSentinel(
-        getStaticIntFieldJni(env, activityTaskManagerCls, BINDER_TRSCTN("registerScreenCaptureObserver"),
-                              "android/app/IActivityTaskManager$Stub"));
-    registerScreenRecordingCallback_code = toSentinel(
-        getStaticIntFieldJni(env, windowManagerCls, BINDER_TRSCTN("registerScreenRecordingCallback"),
-                              "android/view/IWindowManager$Stub"));
+    jclass sessionCls = findClassOrNull(env, kSessionStub);
+    jclass atmCls = sdk >= kMinSdkScreenCaptureObserver ? findClassOrNull(env, kAtmStub) : nullptr;
+    jclass wmCls = sdk >= kMinSdkScreenRecordingCallback ? findClassOrNull(env, kWmStub) : nullptr;
 
-    if (windowSessionCls != nullptr) env->DeleteLocalRef(windowSessionCls);
-    if (activityTaskManagerCls != nullptr) env->DeleteLocalRef(activityTaskManagerCls);
-    if (windowManagerCls != nullptr) env->DeleteLocalRef(windowManagerCls);
+    // `relayout` is the one lookup that must succeed on every supported
+    // release, so only its failure is reported; everything else is optional
+    // and a miss is silent (see getStaticIntFieldJni's `quiet`).
+    relayout_code = toSentinel(getStaticIntFieldJni(env, sessionCls, BINDER_TRSCTN("relayout"), kSessionStub));
+    relayoutAsync_code =
+        toSentinel(getStaticIntFieldJni(env, sessionCls, BINDER_TRSCTN("relayoutAsync"), kSessionStub, true));
+    if (sdk >= kMinSdkRelayout2) {
+        relayout2_code = toSentinel(getStaticIntFieldJni(env, sessionCls, BINDER_TRSCTN("relayout2"), kSessionStub, true));
+        relayoutAsync2_code =
+            toSentinel(getStaticIntFieldJni(env, sessionCls, BINDER_TRSCTN("relayoutAsync2"), kSessionStub, true));
+    }
+    if (atmCls != nullptr) {
+        registerScreenCaptureObserver_code = toSentinel(
+            getStaticIntFieldJni(env, atmCls, BINDER_TRSCTN("registerScreenCaptureObserver"), kAtmStub, true));
+    }
+    if (wmCls != nullptr) {
+        registerScreenRecordingCallback_code = toSentinel(
+            getStaticIntFieldJni(env, wmCls, BINDER_TRSCTN("registerScreenRecordingCallback"), kWmStub, true));
+    }
 
-    if (registerScreenCaptureObserver_code == UINT32_MAX && relayoutAsync_code == UINT32_MAX &&
-        relayout_code == UINT32_MAX && relayoutAsync2_code == UINT32_MAX && relayout2_code == UINT32_MAX &&
-        registerScreenRecordingCallback_code == UINT32_MAX) {
-        LOGD("ERROR getTransactionCodes: Could not get any transaction codes");
+    if (sessionCls != nullptr) env->DeleteLocalRef(sessionCls);
+    if (atmCls != nullptr) env->DeleteLocalRef(atmCls);
+    if (wmCls != nullptr) env->DeleteLocalRef(wmCls);
+
+    if (!anyCodeResolved()) {
+        LOGE("getTransactionCodes: Could not get any transaction codes (sdk=%d)", sdk);
         return false;
     }
     return true;
 }
 
-int (*transactOrig)(void*, int32_t, uint32_t, void*, void*, uint32_t) = nullptr;
+static int (*transactOrig)(void*, int32_t, uint32_t, void*, void*, uint32_t) = nullptr;
 
-int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
-    // Hot-path fast-reject: IPCThreadState::transact is hooked process-wide,
-    // so this runs for *every* Binder call the app makes, not just the two
-    // or three we care about. The original code unconditionally parsed the
-    // parcel header + interface descriptor before ever looking at `code`,
-    // which means every unrelated transaction paid for work whose result
-    // was thrown away. A plain integer compare is essentially free and
-    // rejects the overwhelming majority of calls immediately.
-    //
-    // A failed transaction-code lookup sentinels to UINT32_MAX (see
-    // toSentinel() above), which real AIDL transaction codes can never
-    // equal (they run 1..0x00FFFFFF) -- so a failed lookup simply never
-    // matches any real `code` here, with no separate `code == 0` check
-    // needed on this per-call path.
-    if (likely(code != relayout_code && code != relayoutAsync_code && code != relayout2_code &&
-               code != relayoutAsync2_code && code != registerScreenCaptureObserver_code &&
-               code != registerScreenRecordingCallback_code)) {
-        return transactOrig(self, handle, code, pdata, preply, flags);
+static inline bool isRelayoutCode(uint32_t code) {
+    return code == relayout_code || code == relayoutAsync_code || code == relayout2_code ||
+           code == relayoutAsync2_code;
+}
+
+// Cheap, branch-predictable pre-filter used by the hook: could `code` be
+// one of the transactions we care about at all?
+static inline bool isCandidateCode(uint32_t code) {
+    return isRelayoutCode(code) || code == registerScreenCaptureObserver_code ||
+           code == registerScreenRecordingCallback_code;
+}
+
+// Clear FLAG_SECURE in the (already descriptor-verified) relayout parcel, in
+// place. Every skip/peek below is bounds-checked by FakeParcel; if any ran
+// past the end of the buffer (short/unexpected payload, different Android
+// version, a 32-bit flat-object size that couldn't be determined) ok() is
+// false and nothing is touched.
+//
+// relayout2/relayoutAsync2 (SDK 37+) are assumed to share this same skip
+// sequence up to `flags` -- upstream's own PR design, not something
+// independently confirmed against a stable Android 17 AIDL (a bounds check
+// cannot catch a reordered-but-same-length payload). Worth confirming on a
+// real Android 17 device.
+static void stripFlagSecure(FakeParcel& parcel) {
+    parcel.skipFlatObj();                              // IWindow flat obj
+    if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
+    parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams
+    parcel.skip(3 * sizeof(uint32_t));                 // requestedWidth, requestedHeight, viewVisibility
+
+    uint32_t* pflags = parcel.peekInt32Ref();
+    if (!parcel.ok() || pflags == nullptr) return;
+    if (*pflags & FLAG_SECURE) {
+        *pflags &= ~static_cast<uint32_t>(FLAG_SECURE);
+        LOGI_ONCE(loggedSecureBypass, "Bypassed secure lock");
     }
+}
 
-    auto pparcel = reinterpret_cast<PParcel*>(pdata);
-    if (unlikely(pparcel == nullptr || pparcel->data == nullptr)) {
-        return transactOrig(self, handle, code, pdata, preply, flags);
-    }
+// Slow path. Returns true if the transaction must be swallowed (reported to
+// the caller as success without ever reaching system_server); false means
+// "forward it", possibly after having edited the parcel in place.
+//
+// Dispatch is on (code AND interface descriptor) *per branch*, never on code
+// alone: transaction codes are numbered per AIDL interface, so two of our
+// codes (e.g. IActivityTaskManager's and IWindowManager's) can be
+// numerically equal by coincidence. Choosing the branch from the code first
+// and only then checking the descriptor would silently skip the bypass for
+// whichever interface lost the tie. Every condition below is false-fast, so
+// a coincidence just falls through to the next branch.
+static bool inspectTransaction(uint32_t code, PParcel* pparcel) {
+    if (unlikely(pparcel == nullptr || pparcel->data == nullptr)) return false;
 
-    auto parcel = FakeParcel(pparcel->data, pparcel->data_size);
+    FakeParcel parcel(pparcel->data, pparcel->data_size);
     parcel.skip(binderHeadersLen);  // header
 
-    auto descLen = parcel.readInt32();
-    auto desc = parcel.readString16(descLen);
+    const uint32_t descLen = parcel.readInt32();
+    const char16_t* desc = parcel.readString16(descLen);
+    if (unlikely(!parcel.ok() || desc == nullptr)) return false;
 
-    // Every skip/read above is bounds-checked internally by FakeParcel; if
-    // any of them ran past the end of the parcel (unexpected/short buffer,
-    // different Android version, etc.) `ok()` is false and `desc` is null.
-    // Falling back to the real transact is always safe -- we just don't get
-    // to touch FLAG_SECURE or the capture-observer call for this one call.
-    if (unlikely(!parcel.ok() || desc == nullptr)) {
+    if (isRelayoutCode(code) && BINDER_DESC_CMP(I_WINDOW_SESSION_DESC, desc, descLen)) {
+        stripFlagSecure(parcel);
+        return false;
+    }
+    if (code == registerScreenCaptureObserver_code && BINDER_DESC_CMP(I_ACTIVITY_TASKMANAGER_DESC, desc, descLen)) {
+        // early-return from capture listener
+        LOGI_ONCE(loggedScreenshotBypass, "Bypassed screenshot listener");
+        return true;
+    }
+    if (code == registerScreenRecordingCallback_code && BINDER_DESC_CMP(I_WINDOW_MANAGER_DESC, desc, descLen)) {
+        // registerScreenRecordingCallback(IScreenRecordingCallback) returns
+        // boolean (whether recording is active). An untouched, empty reply
+        // is correct here, not just convenient: both Parcel.readException()
+        // and a boolean AIDL result read compile down to
+        // Parcel::readInt32(), which defaults to 0 on underflow rather than
+        // throwing. Empty reply -> "no exception" + "false", i.e. exactly
+        // the "not being recorded" result we want.
+        LOGI_ONCE(loggedRecordingBypass, "Bypassed screen recording listener");
+        return true;
+    }
+    return false;
+}
+
+// Kept out of line on purpose: this is where the parsing, the FakeParcel
+// locals and the logging calls live. If they were inlined into the hook, the
+// compiler would save callee-saved registers and allocate a stack frame in
+// the hook's prologue *before* the first compare -- i.e. on every Binder
+// transaction in the process, not just the few we care about (measured on
+// x86-64 GCC -O2: ~200 instructions with a 6-register save vs. 15 with none
+// when split). Kept separate, transactHook() below is six compares and a
+// tail call.
+__attribute__((noinline)) static int transactSlow(void* self, int32_t handle, uint32_t code, void* pdata, void* preply,
+                                                  uint32_t flags) {
+    if (inspectTransaction(code, reinterpret_cast<PParcel*>(pdata))) return 0;
+    return transactOrig(self, handle, code, pdata, preply, flags);
+}
+
+// IPCThreadState::transact is hooked process-wide, so this runs for *every*
+// Binder call the app makes. Almost all of them are rejected right here by a
+// plain integer compare and forwarded with a tail call: no parsing, no
+// dereferencing of the Parcel, no stack frame.
+static int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
+    if (likely(!isCandidateCode(code))) {
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
-
-    // Note on the branching below: transaction codes are numbered
-    // per-interface (each AIDL interface starts its own numbering at
-    // FIRST_CALL_TRANSACTION=1), so it's entirely normal for e.g.
-    // relayout_code and registerScreenRecordingCallback_code to end up
-    // numerically equal by coincidence -- they come from two unrelated
-    // interfaces (IWindowSession vs IWindowManager). The interface
-    // descriptor comparison inside each branch is what actually
-    // disambiguates; if `code` matches a branch but the descriptor doesn't,
-    // that branch's inner `if` is simply false and we fall through to the
-    // ordinary transactOrig() at the bottom, i.e. worst case on a coincidental
-    // code collision is "no bypass applied for this call", never a crash.
-    if (code == relayout_code || code == relayoutAsync_code || code == relayout2_code ||
-        code == relayoutAsync2_code) {
-        if (BINDER_DESC_CMP(I_WINDOW_SESSION_DESC, desc, descLen)) {
-            // remove FLAG_SECURE mask
-            //
-            // relayout2/relayoutAsync2 (SDK 37+) are assumed to share this
-            // same skip sequence up to `flags` -- that's upstream's own PR
-            // design (see the relayout2_code comment above), not something
-            // independently re-derived here: Android 17 was still in beta
-            // as of this writing and the exact relayout2 parameter layout
-            // wasn't something a fixed AOSP tag could confirm with
-            // certainty. If that assumption turns out wrong on a real
-            // device, the bounds-checked peekInt32Ref()/ok() guard below
-            // fails closed (no bypass applied) rather than corrupting an
-            // unrelated field silently in-bounds -- but only for a
-            // *shorter* relayout2 payload; a *reordered-but-same-length*
-            // one wouldn't be caught by a bounds check at all. Worth
-            // confirming against a real Android 17 device once out of beta.
-
-            parcel.skipFlatObj();                              // IWindow flat obj
-            if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
-            parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams
-            parcel.skip(3 * sizeof(uint32_t));  // requestedWidth, requestedHeight, viewVisibility
-
-            auto* pflags = parcel.peekInt32Ref();
-            if (parcel.ok() && pflags != nullptr && (*pflags & FLAG_SECURE)) {
-                *pflags &= ~FLAG_SECURE;
-                LOGD("Bypassed secure lock");
-            }
-        }
-    } else if (code == registerScreenCaptureObserver_code) {
-        if (BINDER_DESC_CMP(I_ACTIVITY_TASKMANAGER_DESC, desc, descLen)) {
-            // early-return from capture listener
-            LOGD("Bypassed screenshot listener");
-            return 0;
-        }
-    } else {  // code == registerScreenRecordingCallback_code
-        if (BINDER_DESC_CMP(I_WINDOW_MANAGER_DESC, desc, descLen)) {
-            // registerScreenRecordingCallback(IScreenRecordingCallback)
-            // returns boolean (whether recording is active). An untouched,
-            // empty reply is correct here, not just convenient: both
-            // Parcel.readException() and a boolean AIDL result read compile
-            // down to Parcel::readInt32(), which is documented to default
-            // to 0 on underflow rather than throw (readAligned<T>() in
-            // frameworks/native/libs/binder/Parcel.cpp). Empty reply -> "no
-            // exception" + "false", i.e. exactly the "not being recorded"
-            // result we want -- no reply-parcel writing needed.
-            LOGD("Bypassed screen recording listener");
-            return 0;
-        }
-    }
-    return transactOrig(self, handle, code, pdata, preply, flags);
+    return transactSlow(self, handle, code, pdata, preply, flags);
 }
 
 static bool hookBinder(zygisk::Api* api) {
     ino_t inode;
     dev_t dev;
     if (!getMapping("libbinder.so", &inode, &dev)) {
-        LOGD("ERROR: Could not get libbinder");
+        LOGE("Could not get libbinder");
         return false;
     }
 
     api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
                          reinterpret_cast<void*>(&transactHook), reinterpret_cast<void**>(&transactOrig));
     if (!api->pltHookCommit()) {
-        LOGD("ERROR: pltHookCommit");
+        LOGE("pltHookCommit failed");
         return false;
     }
     // pltHookCommit() succeeding only means the hook table was committed; it
@@ -249,7 +291,7 @@ static bool hookBinder(zygisk::Api* api) {
     // null and every subsequent transactHook() call would crash the app the
     // instant it does any Binder IPC. Fail closed instead.
     if (!transactOrig) {
-        LOGD("ERROR: transact symbol not resolved, refusing to run unhooked");
+        LOGE("transact symbol not resolved, refusing to run unhooked");
         return false;
     }
     return true;
@@ -258,7 +300,7 @@ static bool hookBinder(zygisk::Api* api) {
 static bool run(zygisk::Api* api, JNIEnv* env) {
     sdk = android_get_device_api_level();
     if (sdk <= 0) {
-        LOGD("ERROR android_get_device_api_level: %d", sdk);
+        LOGE("android_get_device_api_level: %d", sdk);
         return false;
     }
     binderHeadersLen = (uint32_t)getBinderHeadersLen(sdk);
@@ -307,6 +349,7 @@ class ih8SecureLock : public zygisk::ModuleBase {
         if (unlikely(PROC_NAME == nullptr)) {
             // Out of memory or similar JNI failure; nothing more we can
             // safely do (and nothing left to release).
+            PROC_NAME = "";
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             return;
         }
@@ -317,10 +360,12 @@ class ih8SecureLock : public zygisk::ModuleBase {
             PROC_NAME = "";
         } else {
             // Intentionally NOT releasing PROC_NAME here: the module stays
-            // resident in this process (DLCLOSE was not requested) and
-            // transactHook()'s LOGD keeps referencing PROC_NAME for the
-            // lifetime of the process, so its backing chars must stay alive.
-            LOGD("Loaded");
+            // resident in this process (DLCLOSE was not requested) and the
+            // log macros keep referencing PROC_NAME for the lifetime of the
+            // process, so its backing chars must stay alive.
+            LOGI("Loaded (sdk=%d, relayout=%d/%d/%d/%d, screenshot=%d, recording=%d)", sdk, (int)relayout_code,
+                 (int)relayoutAsync_code, (int)relayout2_code, (int)relayoutAsync2_code,
+                 (int)registerScreenCaptureObserver_code, (int)registerScreenRecordingCallback_code);
         }
     }
 

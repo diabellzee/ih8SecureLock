@@ -5,31 +5,43 @@
 #include <string.h>
 #include <sys/types.h>
 
-#if defined(__LP64__)
-#define FLAT_BINDER_OBJ_SIZE 24
-#else
-#define FLAT_BINDER_OBJ_SIZE 16
-#endif
-
-#define STUB(n) (n "$Stub")
-#define TRSCTN(n) ("TRANSACTION_" n)
-
 #define ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define STR_LEN(a) (ARR_LEN(a) - 1)
 
-// Renamed from the original bare STUB/TRSCTN (as adopted from upstream v9,
-// https://github.com/j-hc/ih8SecureLock) to avoid the generic names
-// colliding with anything else that includes this header.
+// Helpers to build JNI class / field names for AIDL-generated stubs, e.g.
+// BINDER_STUB("android/view/IWindowSession")  -> "android/view/IWindowSession$Stub"
+// BINDER_TRSCTN("relayout")                   -> "TRANSACTION_relayout"
 #define BINDER_STUB(n) (n "$Stub")
 #define BINDER_TRSCTN(n) ("TRANSACTION_" n)
 
-// Combines the "does descLen/desc match this literal interface descriptor"
-// check used at every transactHook() branch into one place, instead of
-// repeating the STR_LEN(...)==descLen && memcmp(...)==0 pair at each call
-// site (also adopted from upstream v9's consolidation of the same pattern).
+// Does the (descLen, desc) pair read out of a Parcel match this literal
+// interface descriptor? The length is compared first so memcmp never reads
+// past what FakeParcel::readString16() has already bounds-checked.
 #define BINDER_DESC_CMP(descLit, desc, descLen) \
     (STR_LEN(descLit) == (descLen) &&           \
      memcmp((desc), (descLit), (descLen) * sizeof(char16_t)) == 0)
+
+// sizeof(struct flat_binder_object), which depends on the *binder protocol*
+// (i.e. how libbinder was built to match the kernel driver), not on whether
+// the current process is 32- or 64-bit:
+//
+//  * 64-bit binder protocol (version 8): binder_uintptr_t is __u64, so
+//    hdr(4) + flags(4) + binder/handle(8) + cookie(8) = 24 bytes -- in
+//    64-bit *and* 32-bit processes. Every device launching with Android P or
+//    later must use it, even on 32-bit SoCs, and the kernel's old 32-bit
+//    option (CONFIG_ANDROID_BINDER_IPC_32BIT) is documented as breaking
+//    newer Android userspace and was later removed.
+//  * Legacy 32-bit protocol (version 7, Android 4.4-era kernels still found
+//    on a few old 32-bit devices running custom Android 10+ ROMs):
+//    binder_uintptr_t is __u32 -> 16 bytes, only in 32-bit processes.
+//
+// The previous `#if defined(__LP64__) 24 #else 16` therefore mis-sized the
+// object in every 32-bit process on a modern device. See
+// FakeParcel::skipFlatObj() for how the right size is picked at runtime.
+constexpr uint32_t kFlatBinderObjSize64 = 24;
+constexpr uint32_t kFlatBinderObjSize32Legacy = 16;
+// hdr.type of a strong *local* binder: B_PACK_CHARS('s', 'b', '*', 0x85).
+constexpr uint32_t kBinderTypeBinder = 0x73622a85u;
 
 struct PParcel {
     // Layout must mirror the real android::Parcel object we alias onto via
@@ -49,19 +61,15 @@ struct PParcel {
 
 // Bounds-checked cursor over a raw Parcel buffer.
 //
-// The original implementation trusted the caller to pre-compute how many
-// bytes were left before every skip/read, which is easy to get wrong and
-// turns a single miscalculation into an out-of-bounds read on attacker- or
-// otherwise-unexpectedly-shaped IPC data. This version tracks the buffer
-// length itself and "poisons" the parcel (valid = false) the moment any
-// operation would run past the end, after which every further op is a
-// cheap no-op that returns 0/nullptr instead of touching memory. Callers
-// only need to check ok() (or a null return) once, at the point they're
-// about to use the result.
+// The cursor tracks the buffer length itself and "poisons" the parcel
+// (valid = false) the moment any operation would run past the end, after
+// which every further op is a cheap no-op that returns 0/nullptr instead of
+// touching memory. Callers only need to check ok() (or a null return) once,
+// at the point they're about to use the result.
 struct FakeParcel {
    private:
     char* data;
-    uint32_t cur;
+    size_t cur;
     size_t size;
     bool valid;
 
@@ -77,26 +85,64 @@ struct FakeParcel {
     }
 
    public:
-    FakeParcel(char* data, size_t size);
+    FakeParcel(char* data_in, size_t size_in);
 
     inline bool ok() const { return valid; }
     void skip(uint32_t n);
-    uint32_t getCursor();
+
+    // Skip the IWindow strong-binder object. Picks the right implementation
+    // for the current process; see the two variants below.
     void skipFlatObj();
+    // 64-bit binder protocol: always kFlatBinderObjSize64 bytes.
+    void skipFlatObj64();
+    // 32-bit process: the object is 24 bytes (64-bit protocol) or 16 bytes
+    // (legacy protocol). Told apart from the object's own bytes; poisons the
+    // parcel if it can't be told, so callers fail closed.
+    void skipFlatObj32();
 
     uint32_t* peekInt32Ref();
     uint32_t readInt32();
     char16_t* readString16(uint32_t len);
 };
 
-inline FakeParcel::FakeParcel(char* data, size_t size)
-    : data(data), cur(0), size(size), valid(data != nullptr) {}
+inline FakeParcel::FakeParcel(char* data_in, size_t size_in)
+    : data(data_in), cur(0), size(size_in), valid(data_in != nullptr) {}
 
 inline void FakeParcel::skip(uint32_t n) {
     if (ensure(n)) cur += n;
 }
-inline uint32_t FakeParcel::getCursor() { return cur; }
-inline void FakeParcel::skipFlatObj() { skip(FLAT_BINDER_OBJ_SIZE); }
+
+inline void FakeParcel::skipFlatObj64() { skip(kFlatBinderObjSize64); }
+
+inline void FakeParcel::skipFlatObj32() {
+    // Need at least the 16 bytes common to both layouts to look at.
+    if (!ensure(kFlatBinderObjSize32Legacy)) return;
+    uint32_t type, word3;
+    memcpy(&type, data + cur, sizeof(type));
+    memcpy(&word3, data + cur + 12, sizeof(word3));
+    // The IWindow handed to IWindowSession.relayout*() is the app's own
+    // (local) window object, so the header must say "strong local binder".
+    // Anything else (a proxy, a different object type) isn't something we
+    // can size reliably -- bail out instead of guessing.
+    if (type != kBinderTypeBinder) {
+        valid = false;
+        return;
+    }
+    // Offset 8 holds `binder` (a pointer to the local object's weak refs).
+    //  * 64-bit protocol: an 8-byte field zero-extended from a 32-bit
+    //    pointer in a 32-bit process, so the upper half at offset 12 is 0.
+    //  * legacy protocol: `binder` is 4 bytes and offset 12 is `cookie`, a
+    //    pointer to the local object -- never 0 for a live local binder.
+    skip(word3 == 0 ? kFlatBinderObjSize64 : kFlatBinderObjSize32Legacy);
+}
+
+inline void FakeParcel::skipFlatObj() {
+    if constexpr (sizeof(void*) >= 8) {
+        skipFlatObj64();
+    } else {
+        skipFlatObj32();
+    }
+}
 
 inline uint32_t* FakeParcel::peekInt32Ref() {
     if (!ensure(sizeof(uint32_t))) return nullptr;
@@ -114,24 +160,15 @@ inline char16_t* FakeParcel::readString16(uint32_t len) {
     // len+1 for the trailing null u16
     uint64_t bytes = (uint64_t)len * sizeof(char16_t) + sizeof(char16_t);
     // android::Parcel::writeString16() writes through writeInplace(), which
-    // always advances mDataPos to a 4-byte boundary (pad_size() in
-    // AOSP's Parcel.cpp), even though only `bytes` of it is meaningful
-    // data -- the rest is padding. Every one of our three hardcoded
-    // descriptors happens to have odd char16 length ((len+1) even),
-    // making `bytes` already a multiple of 4, so this padding was
-    // previously invisible. It stops being invisible the moment anyone
-    // hooks a descriptor with even char16 length (e.g.
-    // "android.app.IActivityTaskManager", len=32) *and* reads parcel
-    // fields after the descriptor: without this rounding, `cur` would
-    // land 2 bytes short of the real next field, silently misreading
-    // (and, for the flags-clear path, silently corrupting) whatever
-    // happens to sit at the wrong offset -- not an OOB the ensure()
-    // bounds-check would catch, since the misaligned read is still
-    // within the buffer.
+    // always advances mDataPos to a 4-byte boundary (pad_size() in AOSP's
+    // Parcel.cpp), even though only `bytes` of it is meaningful data. This
+    // is invisible for descriptors with an odd char16 length ((len+1) even)
+    // but matters for even-length ones such as
+    // "android.app.IActivityTaskManager" (len=32) followed by more reads.
     uint64_t padded = (bytes + 3) & ~(uint64_t)3;
     if (!ensure(padded)) return nullptr;
     char16_t* s = (char16_t*)(data + cur);
-    cur += (uint32_t)padded;
+    cur += (size_t)padded;
     return s;
 }
 
@@ -143,16 +180,16 @@ inline size_t getBinderHeadersLen(int sdk) {
 
 bool getMapping(const char* lib, ino_t* inode, dev_t* dev);
 
-uint32_t getStaticIntFieldJni(JNIEnv* env, const char* cls_name, const char* field_name);
-
-// Overload for callers reading several static int fields off the *same*
-// class (e.g. getTransactionCodes() in module.cpp: 4 of its 6 lookups all
-// target IWindowSession$Stub). FindClass() is a full classloader lookup,
-// not a cheap operation -- resolving the jclass once and reusing it across
-// fields avoids paying for that lookup redundantly. cls_name_for_log is
-// only used for the error log line and need not be independently
-// resolvable (the class was already looked up by the caller).
-uint32_t getStaticIntFieldJni(JNIEnv* env, jclass cls, const char* field_name, const char* cls_name_for_log);
+// Reads a static int field off an already-resolved class (callers look the
+// class up once with FindClass() and reuse it across fields -- FindClass()
+// is a full classloader lookup, not a cheap pointer compare).
+// cls_name_for_log is only used in log lines. With `quiet` set, a missing
+// class or field is silent: for *optional* transactions that legitimately
+// don't exist on every Android version, a miss is the normal case, not an
+// error worth a logcat line (and a syscall) in every app process.
+// Returns 0 on any failure.
+uint32_t getStaticIntFieldJni(JNIEnv* env, jclass cls, const char* field_name, const char* cls_name_for_log,
+                              bool quiet = false);
 
 // NOTE: not currently called anywhere in this module (no companion process is
 // used - all hooking happens in-process). Kept as a general-purpose utility
